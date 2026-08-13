@@ -1,8 +1,9 @@
 import os
+import re
 import discord
+import random
 import asyncio
 import aiohttp
-import random
 import time
 from discord.ext import commands
 
@@ -41,7 +42,6 @@ PROXY_SOURCES = {
     ]
 }
 
-TEST_URL = "http://httpbin.org/ip"
 TEST_TIMEOUT = aiohttp.ClientTimeout(total=10)
 
 # ── helpers ──
@@ -57,6 +57,18 @@ def parse_proxy_line(line, ptype):
             if "." in ip:
                 return {"ip": ip, "port": port, "type": ptype, "url": f"{ptype}://{ip}:{port}"}
     return None
+
+def extract_proxies_from_text(text, ptype="http"):
+    pattern = r'(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}):(\d{1,5})'
+    matches = re.findall(pattern, text)
+    proxies = []
+    seen = set()
+    for ip, port in matches:
+        key = f"{ip}:{port}"
+        if key not in seen:
+            seen.add(key)
+            proxies.append({"ip": ip, "port": port, "type": ptype, "url": f"{ptype}://{ip}:{port}"})
+    return proxies
 
 async def fetch_proxies(session, url):
     try:
@@ -96,7 +108,7 @@ async def test_proxy(session, proxy):
     start = time.time()
     try:
         async with session.get(
-            TEST_URL, 
+            "http://httpbin.org/get", 
             proxy=proxy["url"], 
             timeout=TEST_TIMEOUT,
             ssl=False
@@ -106,16 +118,32 @@ async def test_proxy(session, proxy):
                 try:
                     data = await resp.json()
                     origin = data.get("origin", "unknown")
+                    headers = data.get("headers", {})
+                    
+                    # anonymity detection
+                    hdr_str = str(headers).lower()
+                    xff = headers.get("X-Forwarded-For", headers.get("X-Forwarded-For", ""))
+                    via = headers.get("Via", "")
+                    x_real = headers.get("X-Real-Ip", "")
+                    
+                    if xff or x_real:
+                        anonymity = "🔴 Transparent"
+                    elif via or "proxy" in hdr_str or "squid" in hdr_str:
+                        anonymity = "🟡 Anonymous"
+                    else:
+                        anonymity = "🟢 Elite"
+                        
                 except:
                     origin = "unknown"
-                return {"ok": True, "ms": elapsed, "origin": origin}
-    except Exception as e:
+                    anonymity = "❓ Unknown"
+                return {"ok": True, "ms": elapsed, "origin": origin, "anonymity": anonymity}
+    except Exception:
         pass
-    return {"ok": False, "ms": 0, "origin": None}
+    return {"ok": False, "ms": 0, "origin": None, "anonymity": None}
 
-async def test_proxies(ptype=None, max_test=50):
+async def test_proxies_from_db(ptype=None, max_test=50):
     connector = aiohttp.TCPConnector(ssl=False, limit=50)
-    async with aiohttp.ClientSession(connector=connector, trust_env=True) as session:
+    async with aiohttp.ClientSession(connector=connector) as session:
         pool = []
         if ptype and ptype in proxies_db:
             pool = proxies_db[ptype][:max_test * 2]
@@ -134,6 +162,24 @@ async def test_proxies(ptype=None, max_test=50):
             if result["ok"]:
                 proxy["ms"] = result["ms"]
                 proxy["origin"] = result["origin"]
+                proxy["anonymity"] = result["anonymity"]
+                working.append(proxy)
+        
+        working.sort(key=lambda x: x["ms"])
+        return working
+
+async def test_proxies_list(proxy_list):
+    connector = aiohttp.TCPConnector(ssl=False, limit=50)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        tasks = [test_proxy(session, p) for p in proxy_list]
+        results = await asyncio.gather(*tasks)
+        
+        working = []
+        for proxy, result in zip(proxy_list, results):
+            if result["ok"]:
+                proxy["ms"] = result["ms"]
+                proxy["origin"] = result["origin"]
+                proxy["anonymity"] = result["anonymity"]
                 working.append(proxy)
         
         working.sort(key=lambda x: x["ms"])
@@ -152,8 +198,9 @@ async def on_ready():
 async def help(ctx):
     embed = discord.Embed(title="🌐 proxy bot commands", color=discord.Color.green())
     embed.add_field(name="!scrape", value="scrape fresh proxies from all sources", inline=False)
-    embed.add_field(name="!proxies [type] [count]", value="get random proxies (http/https/socks4/socks5)", inline=False)
-    embed.add_field(name="!test [type] [count]", value="test proxies and return working ones with speed", inline=False)
+    embed.add_field(name="!proxies [type] [count]", value="get random proxies from db", inline=False)
+    embed.add_field(name="!test [type] [count]", value="test proxies from db OR paste a list", inline=False)
+    embed.add_field(name="!testlist <type>", value="reply to a proxy list message to test it", inline=False)
     embed.add_field(name="!testone <ip:port> [type]", value="test a single proxy", inline=False)
     embed.add_field(name="!stats", value="show scraped proxy counts", inline=False)
     embed.add_field(name="!random [type]", value="get one random proxy", inline=False)
@@ -211,17 +258,70 @@ async def proxies(ctx, ptype: str = "http", count: int = 10):
 
 @bot.command()
 async def test(ctx, ptype: str = None, count: int = 20):
-    ptype = ptype.lower() if ptype else None
-    if ptype and ptype not in proxies_db:
+    ptype = ptype.lower() if ptype else "http"
+    if ptype not in proxies_db:
         return await ctx.send("valid types: http, https, socks4, socks5")
     
-    msg = await ctx.send(f"testing up to {count} proxies... please wait")
-    working = await test_proxies(ptype, count)
+    # ── check if user pasted proxies in this message or replied to a list ──
+    target_text = ""
+    
+    # if replying to another message, grab its content
+    if ctx.message.reference and ctx.message.reference.resolved:
+        ref = ctx.message.reference.resolved
+        if isinstance(ref, discord.Message):
+            target_text += ref.content + "\n"
+    
+    # also grab any ip:port patterns from the current message after the command
+    full_text = ctx.message.content
+    # strip command
+    cmd_stripped = full_text.replace(f"{PREFIX}test", "").strip()
+    # remove first arg (type) and second arg (count if numeric)
+    parts = cmd_stripped.split()
+    extra_text = ""
+    if len(parts) >= 2 and parts[1].isdigit():
+        extra_text = " ".join(parts[2:])
+    elif len(parts) >= 1:
+        extra_text = " ".join(parts[1:])
+    
+    target_text += extra_text
+    
+    pasted_proxies = extract_proxies_from_text(target_text, ptype)
+    
+    if pasted_proxies:
+        msg = await ctx.send(f"testing **{len(pasted_proxies)}** pasted proxies... please wait")
+        working = await test_proxies_list(pasted_proxies)
+        
+        if not working:
+            return await msg.edit(content="no working proxies found in your list.")
+        
+        lines = [f"{p['ip']}:{p['port']} | {p['ms']}ms | {p['anonymity']}" for p in working[:30]]
+        text = "\n".join(lines)
+        
+        embed = discord.Embed(
+            title=f"✅ working proxies ({len(working)}/{len(pasted_proxies)})",
+            color=discord.Color.green()
+        )
+        if len(text) > 4000:
+            # send as file if too long
+            from io import StringIO
+            file_text = "\n".join([f"{p['ip']}:{p['port']} | {p['ms']}ms | {p['anonymity']}" for p in working])
+            file = discord.File(StringIO(file_text), filename="working_proxies.txt")
+            await msg.edit(content=f"found **{len(working)}** working proxies:", attachments=[file])
+            return
+        
+        embed.description = f"```{text}```"
+        embed.set_footer(text="🟢 Elite = best | 🟡 Anonymous | 🔴 Transparent = worst")
+        await msg.edit(content=None, embed=embed)
+        return
+    
+    # ── fallback: test from database ──
+    msg = await ctx.send(f"testing up to {count} proxies from database... please wait")
+    working = await test_proxies_from_db(ptype, count)
     
     if not working:
-        return await msg.edit(content="no working proxies found. free proxies die fast — try `!scrape` for fresh ones or increase test count.")
+        return await msg.edit(content="no working proxies found. free proxies die fast — try `!scrape` for fresh ones or paste your own list.")
     
-    lines = [f"{p['ip']}:{p['port']} | {p['ms']}ms | origin: {p['origin']}" for p in working[:20]]
+    lines = [f"{p['ip']}:{p['port']} | {p['ms']}ms | {p['anonymity']}" for p in working[:20]]
     text = "\n".join(lines)
     
     embed = discord.Embed(
@@ -229,7 +329,49 @@ async def test(ctx, ptype: str = None, count: int = 20):
         color=discord.Color.green()
     )
     embed.description = f"```{text}```"
-    embed.set_footer(text="sorted by response time (fastest first)")
+    embed.set_footer(text="sorted by speed | 🟢 Elite = best | 🟡 Anonymous | 🔴 Transparent")
+    await msg.edit(content=None, embed=embed)
+
+@bot.command()
+async def testlist(ctx, ptype: str = "http"):
+    """reply to a message containing proxies to test them"""
+    ptype = ptype.lower()
+    if ptype not in proxies_db:
+        return await ctx.send("valid types: http, https, socks4, socks5")
+    
+    if not ctx.message.reference or not ctx.message.reference.resolved:
+        return await ctx.send("reply to a message containing a proxy list to test it.")
+    
+    ref = ctx.message.reference.resolved
+    if not isinstance(ref, discord.Message):
+        return await ctx.send("could not read the replied message.")
+    
+    pasted_proxies = extract_proxies_from_text(ref.content, ptype)
+    if not pasted_proxies:
+        return await ctx.send("no valid ip:port proxies found in that message.")
+    
+    msg = await ctx.send(f"testing **{len(pasted_proxies)}** proxies from replied message...")
+    working = await test_proxies_list(pasted_proxies)
+    
+    if not working:
+        return await msg.edit(content="no working proxies found in that list.")
+    
+    lines = [f"{p['ip']}:{p['port']} | {p['ms']}ms | {p['anonymity']}" for p in working[:30]]
+    text = "\n".join(lines)
+    
+    embed = discord.Embed(
+        title=f"✅ working proxies ({len(working)}/{len(pasted_proxies)})",
+        color=discord.Color.green()
+    )
+    if len(text) > 4000:
+        from io import StringIO
+        file_text = "\n".join([f"{p['ip']}:{p['port']} | {p['ms']}ms | {p['anonymity']}" for p in working])
+        file = discord.File(StringIO(file_text), filename="working_proxies.txt")
+        await msg.edit(content=f"found **{len(working)}** working proxies:", attachments=[file])
+        return
+    
+    embed.description = f"```{text}```"
+    embed.set_footer(text="🟢 Elite = best | 🟡 Anonymous | 🔴 Transparent = worst")
     await msg.edit(content=None, embed=embed)
 
 @bot.command()
@@ -249,6 +391,7 @@ async def testone(ctx, proxy_str: str, ptype: str = "http"):
         embed = discord.Embed(title="✅ proxy works", color=discord.Color.green())
         embed.add_field(name="Proxy", value=proxy_str, inline=True)
         embed.add_field(name="Response", value=f"{result['ms']}ms", inline=True)
+        embed.add_field(name="Anonymity", value=result["anonymity"], inline=True)
         embed.add_field(name="Origin IP", value=result["origin"], inline=True)
     else:
         embed = discord.Embed(title="❌ proxy dead", color=discord.Color.red())
