@@ -54,7 +54,7 @@ def parse_proxy_line(line, ptype):
         if len(parts) >= 2:
             ip = parts[0]
             port = parts[1].split()[0]
-            if ip.replace(".", "").isdigit() or "." in ip:
+            if "." in ip:
                 return {"ip": ip, "port": port, "type": ptype, "url": f"{ptype}://{ip}:{port}"}
     return None
 
@@ -74,12 +74,13 @@ async def scrape_all():
     
     async with aiohttp.ClientSession() as session:
         tasks = []
+        ptypes = []
         for ptype, urls in PROXY_SOURCES.items():
             for url in urls:
-                tasks.append((ptype, fetch_proxies(session, url)))
+                tasks.append(fetch_proxies(session, url))
+                ptypes.append(ptype)
         
-        results = await asyncio.gather(*[t[1] for t in tasks])
-        ptypes = [t[0] for t in tasks]
+        results = await asyncio.gather(*tasks)
         
         for ptype, lines in zip(ptypes, results):
             for line in lines:
@@ -94,30 +95,33 @@ async def scrape_all():
 async def test_proxy(session, proxy):
     start = time.time()
     try:
-        connector = aiohttp.TCPConnector(ssl=False)
         async with session.get(
             TEST_URL, 
             proxy=proxy["url"], 
             timeout=TEST_TIMEOUT,
-            connector=connector
+            ssl=False
         ) as resp:
             if resp.status == 200:
                 elapsed = round((time.time() - start) * 1000)
-                data = await resp.json()
-                origin = data.get("origin", "unknown")
+                try:
+                    data = await resp.json()
+                    origin = data.get("origin", "unknown")
+                except:
+                    origin = "unknown"
                 return {"ok": True, "ms": elapsed, "origin": origin}
     except Exception as e:
         pass
     return {"ok": False, "ms": 0, "origin": None}
 
 async def test_proxies(ptype=None, max_test=50):
-    async with aiohttp.ClientSession() as session:
+    connector = aiohttp.TCPConnector(ssl=False, limit=50)
+    async with aiohttp.ClientSession(connector=connector, trust_env=True) as session:
         pool = []
         if ptype and ptype in proxies_db:
-            pool = proxies_db[ptype][:max_test]
+            pool = proxies_db[ptype][:max_test * 2]
         else:
             for v in proxies_db.values():
-                pool.extend(v[:max_test // 4])
+                pool.extend(v[:max_test])
         
         random.shuffle(pool)
         pool = pool[:max_test]
@@ -148,8 +152,8 @@ async def on_ready():
 async def help(ctx):
     embed = discord.Embed(title="🌐 proxy bot commands", color=discord.Color.green())
     embed.add_field(name="!scrape", value="scrape fresh proxies from all sources", inline=False)
-    embed.add_field(name="!proxies [type] [count]", value="get working proxies (types: http/https/socks4/socks5)", inline=False)
-    embed.add_field(name="!test [type] [count]", value="test scraped proxies and return working ones", inline=False)
+    embed.add_field(name="!proxies [type] [count]", value="get random proxies (http/https/socks4/socks5)", inline=False)
+    embed.add_field(name="!test [type] [count]", value="test proxies and return working ones with speed", inline=False)
     embed.add_field(name="!testone <ip:port> [type]", value="test a single proxy", inline=False)
     embed.add_field(name="!stats", value="show scraped proxy counts", inline=False)
     embed.add_field(name="!random [type]", value="get one random proxy", inline=False)
@@ -215,7 +219,7 @@ async def test(ctx, ptype: str = None, count: int = 20):
     working = await test_proxies(ptype, count)
     
     if not working:
-        return await msg.edit(content="no working proxies found. try `!scrape` to get fresh ones.")
+        return await msg.edit(content="no working proxies found. free proxies die fast — try `!scrape` for fresh ones or increase test count.")
     
     lines = [f"{p['ip']}:{p['port']} | {p['ms']}ms | origin: {p['origin']}" for p in working[:20]]
     text = "\n".join(lines)
@@ -237,7 +241,8 @@ async def testone(ctx, proxy_str: str, ptype: str = "http"):
     proxy = {"ip": ip, "port": port, "type": ptype, "url": f"{ptype}://{ip}:{port}"}
     
     msg = await ctx.send(f"testing {proxy_str}...")
-    async with aiohttp.ClientSession() as session:
+    connector = aiohttp.TCPConnector(ssl=False)
+    async with aiohttp.ClientSession(connector=connector) as session:
         result = await test_proxy(session, proxy)
     
     if result["ok"]:
@@ -260,7 +265,6 @@ async def export(ctx, ptype: str = "http"):
     lines = [f"{p['ip']}:{p['port']}" for p in proxies_db[ptype]]
     text = "\n".join(lines)
     
-    # send as file if too long
     if len(text) > 1900:
         from io import StringIO
         file = discord.File(StringIO(text), filename=f"{ptype}_proxies.txt")
